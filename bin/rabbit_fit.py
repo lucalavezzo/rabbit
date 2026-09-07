@@ -164,6 +164,24 @@ def make_parser():
         help="Compute the saturated likelihood test for Project mappings",
     )
     parser.add_argument(
+        "--saturatedSeedFrom",
+        default=None,
+        type=str,
+        help="""
+        Seed the SATURATED projection fit from a previous saturated fitresults.hdf5
+        (a full COMPOSITE vector: model params + the per-projected-bin saturated POIs +
+        nuisances). Without it the saturated fit always cold-starts from
+        xparam_default, because init_fit_parms() rebuilds x and xdefaultassign()
+        resets it -- so a rerun retraces the whole descent before making progress.
+        Matching is BY NAME (load_fitresult uses np.intersect1d on the parameter
+        names), which is what makes the composite layout work automatically.
+        NB this is a pure continuation along the same descent path: where a
+        minimisation starts is a numerical choice, the statistic is the minimum.
+        Do NOT confuse it with seeding the saturated fit from a NOMINAL postfit,
+        which leaves the bin POIs at defaults and gives an incoherent start point.
+        """,
+    )
+    parser.add_argument(
         "--noChi2",
         default=False,
         action="store_true",
@@ -426,6 +444,7 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                     unblind=args.unblind,
                     blinding_group=args.blindingGroup,
                     freeze_parameters=args.freezeParameters,
+                    blinding_real_data=args.blindingRealData,
                 )
                 fitter_saturated.x0[composite_model.nparams :].assign(
                     toy_x0[orig_model.nparams :]
@@ -442,10 +461,74 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 fitter_saturated.tau.assign(saved_tau)
 
                 fitter_saturated.xdefaultassign()
+                # The composite re-init reordered and resized the parameter
+                # vector (one POI per projected bin, inserted ahead of the
+                # original model's block), so regularizers must be re-armed or
+                # they read the wrong entries. xdefaultassign() above is
+                # deliberate but does not arm them.
+                fitter_saturated.arm_regularizers()
+                # Optional warm start from a previous SATURATED result. Deliberately
+                # AFTER arm_regularizers(): defaultassign() arms at the default point
+                # for the nominal fit, so a regularizer capturing prefit expectations
+                # (SVD's nexp0) keeps the same meaning here.
+                if args.saturatedSeedFrom is not None:
+                    # Read the COMPOSITE vector out of mappings/<key>/saturated_fit.
+                    # NOT load_fitresult(): that reads the file's ROOT `parms`, which in
+                    # a --noFit saturated pass is the NOMINAL point echoed back (3753
+                    # entries, no saturated_ bins). Seeding from it leaves the 39 bin
+                    # POIs at their defaults, which is an incoherent start point and
+                    # lands WORSE than cold. The saturated_fit dump has all 3792 and
+                    # stores RAW x (it was written from fitter_saturated.x), so the
+                    # values go straight into x with no POI/sqrt conversion.
+                    import h5py as _h5
+                    from wums import ioutils as _ioutils
+
+                    # NB every .get() must happen INSIDE the `with`: pickle_load_h5py
+                    # hands back H5PickleProxy objects that read lazily from the still-
+                    # open file, and dereferencing one after the file closes raises
+                    # "underlying file has been closed".
+                    _sn = _sv = None
+                    with _h5.File(args.saturatedSeedFrom, "r") as _fs:
+                        _rk = [k for k in _fs.keys() if k.startswith("results")]
+                        if not _rk:
+                            raise ValueError(
+                                f"--saturatedSeedFrom {args.saturatedSeedFrom}: no results group"
+                            )
+                        _rs = _ioutils.pickle_load_h5py(_fs[_rk[0]])
+                        for _, _m in (_rs.get("mappings") or {}).items():
+                            if (
+                                isinstance(_m, dict)
+                                and _m.get("saturated_fit") is not None
+                            ):
+                                _h = _m["saturated_fit"]["parms"].get()
+                                _sn = [str(x) for x in _h.axes[0]]
+                                _sv = np.asarray(_h.values())
+                                break
+                    if _sn is None:
+                        raise ValueError(
+                            f"--saturatedSeedFrom {args.saturatedSeedFrom}: no "
+                            "mappings/<key>/saturated_fit dump (was it produced by a "
+                            "rabbit with the saturated-fit diagnostics?)"
+                        )
+                    _idx = {n: i for i, n in enumerate(_sn)}
+                    _cur = np.asarray(fitter_saturated.parms).astype(str)
+                    _xv = fitter_saturated.x.numpy()
+                    _n = 0
+                    for _i, _nm in enumerate(_cur):
+                        _j = _idx.get(_nm)
+                        if _j is not None:
+                            _xv[_i] = _sv[_j]
+                            _n += 1
+                    fitter_saturated.x.assign(_xv)
+                    logger.info(
+                        f"[saturated] seeded {_n}/{len(_cur)} parameters from "
+                        f"{args.saturatedSeedFrom}"
+                    )
                 cb = fitter_saturated.minimize()
+                cov_saturated = None
                 if not args.noHessian:
                     _, grad, hess = fitter_saturated.loss_val_grad_hess()
-                    edmval, cov = fitter_saturated.edmval_cov(grad, hess)
+                    edmval, cov_saturated = fitter_saturated.edmval_cov(grad, hess)
                     logger.info(f"edmval: {edmval}")
                 else:
                     edmval = None
@@ -464,6 +547,28 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 ws.add_chi2(
                     chi2val, ndf, prefit, mapping, saturated=True, edmval=edmval
                 )
+
+                # Persist the saturated fit itself, not just its chi2, under
+                # results["mappings"][<mapping>]["saturated_fit"], using the same
+                # key names the primary fit uses at top level.
+                SAT = dict(mapping_key=mapping.key, group="saturated_fit")
+                ws.add_value(float(nllvalreduced), "nllvalreduced", **SAT)
+                ws.add_named_parms_hist(
+                    fitter_saturated.x.numpy(),
+                    fitter_saturated.parms,
+                    variances=(
+                        np.diag(cov_saturated) if cov_saturated is not None else None
+                    ),
+                    **SAT,
+                )
+                ws.add_minimizer_status(fitter_saturated.minimizer_status(), **SAT)
+                if edmval is not None:
+                    ws.add_value(float(edmval), "edmval", **SAT)
+                if cov_saturated is not None:
+                    ws.add_named_cov_hist(cov_saturated, fitter_saturated.parms, **SAT)
+                if cb is not None and getattr(cb, "loss_history", None) is not None:
+                    ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss", **SAT)
+                    ws.add_1D_integer_hist(cb.time_history, "epoch", "time", **SAT)
 
         if args.saveHistsPerProcess and not mapping.skip_per_process:
             logger.info(f"Save processes histogram for {mapping.key}")
@@ -829,6 +934,30 @@ def main():
         [np.array([x]) if x <= 0 else 1 + np.arange(x, dtype=int) for x in args.toys]
     )
     blinded_fits = [f == 0 or (f > 0 and args.toysDataMode == "observed") for f in fits]
+
+    # --blindingRealData forces the real-data blinding seed for a non-integer dataset. That is only
+    # legitimate when the dataset really IS data (e.g. an unfolded sigma_UL measurement).
+    # NB an ASIMOV fit (-t -1) is not blinded at all (see blinded_fits above: f == 0 or an "observed"
+    # toy), so strictly there is no offset for it to leak; the refusal below is belt-and-braces --
+    # asking for a real-DATA blinding seed on a not-data dataset is a configuration error worth
+    # stopping on, and pseudodata DOES get blinded when --toysDataMode observed.
+    if args.blindingRealData:
+        if np.any(fits < 0):
+            raise ValueError(
+                "--blindingRealData with an Asimov fit (-t -1): an Asimov postfit sits at the "
+                "blinding offset, so using the real-data seed would leak it. Drop one of the two."
+            )
+        if args.pseudoData is not None:
+            raise ValueError(
+                f"--blindingRealData with --pseudoData '{args.pseudoData}': pseudodata is not real "
+                "data, and giving it the real-data blinding seed would leak that offset. "
+                "Drop one of the two."
+            )
+        logger.warning(
+            "--blindingRealData: using the REAL-DATA blinding seed for a non-integer dataset. "
+            "This is correct only if the input really is data (e.g. unfolded sigma_UL); it makes "
+            "the blinded parameters comparable with the counting fits."
+        )
 
     indata = inputdata.FitInputData(args.filename, args.pseudoData)
 

@@ -41,6 +41,7 @@ all = ["plotting", "conversion"]
 rabbit_debug_inputdata = "bin.debug_inputdata:main"
 rabbit_fit = "bin.rabbit_fit:main"
 rabbit_limits = "bin.rabbit_limits:main"
+rabbit_merge_fitresults = "bin.rabbit_merge_fitresults:main"
 rabbit_plot_cov = "bin.rabbit_plot_cov:main"
 rabbit_plot_hists = "bin.rabbit_plot_hists:main"
 rabbit_plot_hists_uncertainties = "bin.rabbit_plot_hists_uncertainties:main"

@@ -194,6 +194,7 @@ def common_parser():
         choices=[
             "trust-krylov",
             "trust-exact",
+            "trust-constr",
             "BFGS",
             "L-BFGS-B",
             "CG",
@@ -299,6 +300,22 @@ def common_parser():
         Each entry is an exact parameter name or a regex matched against the full parameter
         name (use e.g. 'alphaS.*' to match a family of parameters).
         E.g. use '--unblind signal' to unblind a parameter named signal or '--unblind' to unblind all.
+        """,
+    )
+    parser.add_argument(
+        "--blindingRealData",
+        action="store_true",
+        help="""
+        Treat this dataset as REAL DATA when choosing the blinding seed, even though data_obs are
+        not integer counts. The blinding seed normally gets a '_data' suffix only when data_obs are
+        integers, so a continuous dataset (Asimov, expected, pseudodata, but ALSO genuinely real
+        unfolded/differential data) is given a DIFFERENT offset than the corresponding real-data
+        counting fit. Use this flag for real but non-integer data -- e.g. an unfolded sigma_UL fit --
+        so that its blinded parameters carry the SAME offset as the counting fits and remain
+        comparable with them.
+        DANGER: never use this with Asimov (-t -1) or --pseudoData. Those fits sit at the truth, so
+        their postfit value IS essentially the offset; giving them the real-data seed would leak the
+        real-data offset. The fit aborts if this flag is combined with Asimov/pseudodata.
         """,
     )
     parser.add_argument(

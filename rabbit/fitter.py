@@ -125,6 +125,9 @@ class Fitter:
         self.minimizer_maxiter = getattr(options, "minimizerMaxiter", None)
         self.minimizer_gtol = getattr(options, "minimizerGtol", None)
         self.minimizer_ftol = getattr(options, "minimizerFtol", None)
+        # scipy's OptimizeResult from the last fit(), so the convergence
+        # outcome can be written to the output. None if the minimizer raised.
+        self.minimizer_result = None
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
@@ -231,6 +234,7 @@ class Fitter:
             unblind=options.unblind,
             blinding_group=options.blindingGroup,
             freeze_parameters=options.freezeParameters,
+            blinding_real_data=getattr(options, "blindingRealData", False),
         )
 
         self.nexpnom = tf.Variable(
@@ -244,6 +248,7 @@ class Fitter:
         unblind=False,
         blinding_group=[],
         freeze_parameters=[],
+        blinding_real_data=False,
     ):
         self.param_model = param_model
 
@@ -270,9 +275,15 @@ class Fitter:
                 trainable=False,
                 name="offset_theta",
             )
-            self.init_blinding_values(unblind, blinding_group)
+            self.init_blinding_values(
+                unblind, blinding_group, blinding_real_data=blinding_real_data
+            )
 
         self.parms = np.concatenate([self.param_model.params, self.indata.systs])
+        # Layout changed: anything a regularizer resolved is now stale. Marked
+        # rather than re-armed here because this runs from __init__, before
+        # regularizers are attached; discharged by arm_regularizers().
+        self._regularizers_armed = False
 
         # tf tensor containing default constraint minima
         theta0default = np.zeros(self.indata.nsyst)
@@ -419,6 +430,14 @@ class Fitter:
         self.regularizers = []
         # one common regularization strength parameter
         self.tau = tf.Variable(1.0, trainable=True, name="tau", dtype=tf.float64)
+        # When true the regularizers are handed to the minimizer as HARD
+        # constraints (see Regularizer.constraint_spec) and contribute nothing
+        # to the loss. Set by minimize() for constrained methods; a penalty and
+        # a constraint over the same feasible set must never both be active.
+        self.regularizers_as_constraints = False
+        # which constraint rows survive the frozen-parameter filter (set in
+        # _build_scipy_constraints); None = no filtering yet
+        self._constraint_row_mask = None
 
         # External likelihood terms (additive g^T x + 0.5 x^T H x
         # contributions to the NLL). See rabbit.external_likelihood for
@@ -578,7 +597,10 @@ class Fitter:
         self.update_frozen_params()
 
     def init_blinding_values(
-        self, unblind_parameter_expressions=[], blinding_group_expressions=[]
+        self,
+        unblind_parameter_expressions=[],
+        blinding_group_expressions=[],
+        blinding_real_data=False,
     ):
         logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
         all_param_names = [
@@ -600,6 +622,18 @@ class Fitter:
         # check if dataset is an integer (i.e. if it is real data or not) and use this to choose the random seed
         is_dataobs_int = np.sum(
             np.equal(self.indata.data_obs, np.floor(self.indata.data_obs))
+        )
+        # ...unless the caller declares the (non-integer) dataset to be real data. Real but
+        # continuous data -- an unfolded sigma_UL measurement, say -- would otherwise be seeded
+        # like an Asimov/pseudodata fit and so carry a DIFFERENT offset than the counting fits,
+        # making its blinded parameters incomparable with them. --blindingRealData forces the
+        # real-data seed. rabbit_fit refuses to combine it with Asimov/pseudodata, because those
+        # sit at the truth and would then leak the real-data offset.
+        if blinding_real_data:
+            is_dataobs_int = True
+        logger.debug(
+            f"Blinding seed uses the real-data suffix: {bool(is_dataobs_int)}"
+            + (" (forced by --blindingRealData)" if blinding_real_data else "")
         )
 
         def deterministic_random_from_string(s, mean=0.0, std=5.0):
@@ -809,10 +843,149 @@ class Fitter:
         if self.do_blinding:
             self.set_blinding_offsets(False)
 
+        self.arm_regularizers()
+
+    def _constraint_val_jac(self, xval):
+        """(values, jacobian) of every regularizer constraint at ``xval``.
+
+        The Jacobian is [n_constraints, n_parameters]. It is extremely sparse in
+        practice -- the NP damping conditions touch ~6 of several thousand
+        parameters -- but it is returned dense because scipy's trust-constr
+        copies it anyway at these sizes, and a wrong sparsity pattern is a much
+        worse failure mode than a few thousand zeros.
+        """
+        x = tf.Variable(tf.constant(xval, dtype=self.x.dtype), trainable=True)
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(x)
+            # observables are passed as None: constraint_spec is for
+            # parameter-space conditions (the NP damping wall reads lambdas
+            # only). A regularizer needing the mapping should return None from
+            # constraint_spec and stay on the penalty path.
+            nexp = None
+            vals = []
+            for reg in self.regularizers:
+                spec = reg.constraint_spec(x, nexp)
+                if spec is None:
+                    raise ValueError(
+                        f"{type(reg).__name__} has no constraint_spec(); it can "
+                        "only be used as a penalty, so pick a non-constrained "
+                        "--minimizerMethod."
+                    )
+                vals.append(spec[0])
+            allvals = tf.concat(vals, axis=0)
+        jac = tape.jacobian(allvals, x, experimental_use_pfor=False)
+        del tape
+        vals, jac = allvals.numpy(), jac.numpy()
+
+        # FROZEN PARAMETERS MUST NOT APPEAR IN THE CONSTRAINT JACOBIAN.
+        # rabbit freezes by stop_gradient (get_model_nui/get_poi), i.e. the value
+        # still flows into the likelihood and only the GRADIENT is zeroed. Under a
+        # gradient-driven minimizer that pins the parameter, because nothing ever
+        # pushes it. A constrained minimizer is different: a nonzero constraint
+        # Jacobian entry is its own handle on the variable, and with no opposing
+        # objective gradient it will move it freely along that direction -- and
+        # since the value is NOT pinned, the likelihood silently follows.
+        # Observed: lambda_inf 1.0 -> 17.6 and lambda_inf_nu 1.6853 -> 4.95 while
+        # both were "frozen", with an erratic loss because the objective changed
+        # in directions the reported gradient called flat.
+        if len(self.frozen_indices):
+            jac[:, self.frozen_indices] = 0.0
+        if self._constraint_row_mask is not None:
+            vals, jac = vals[self._constraint_row_mask], jac[self._constraint_row_mask]
+        return vals, jac
+
+    def _build_scipy_constraints(self):
+        """Regularizer feasible sets as scipy NonlinearConstraint objects.
+
+        keep_feasible=True: every iterate stays inside the physical region. That
+        is not just tidiness here -- outside it the SCETlib NP prediction can go
+        negative and the likelihood becomes NaN with a flat gradient, which a
+        penalty cannot prevent the minimizer from wandering into.
+        """
+        if not len(self.regularizers):
+            return []
+        import scipy.optimize
+
+        self._constraint_row_mask = None
+        lows = []
+        xprobe = self.x.numpy()
+        for reg in self.regularizers:
+            spec = reg.constraint_spec(tf.constant(xprobe, dtype=self.x.dtype), None)
+            if spec is None:
+                raise ValueError(
+                    f"{type(reg).__name__} has no constraint_spec(); it can only "
+                    "be used as a penalty, so pick a non-constrained "
+                    "--minimizerMethod."
+                )
+            lows.append(spec[1].numpy())
+        lb = np.concatenate(lows)
+
+        # Drop constraints that no free parameter can influence (every Jacobian
+        # entry frozen away). They are constants: satisfied or not, the fit cannot
+        # act on them, and a zero row is degenerate in the QP. Report them, and
+        # refuse outright if one is VIOLATED -- that is a misconfigured fit
+        # (a frozen parameter parked outside the physical region), not something
+        # to optimize around.
+        c_all, j_all = self._constraint_val_jac(xprobe)
+        live = np.abs(j_all).sum(axis=1) > 0
+        if not live.all():
+            dead_bad = int(np.sum((~live) & (c_all < lb - 1e-12)))
+            if dead_bad:
+                raise ValueError(
+                    f"{dead_bad} damping condition(s) are VIOLATED by frozen "
+                    f"parameters alone; the fit cannot satisfy them. Check the "
+                    f"frozen lambda values against the wall."
+                )
+            logger.info(
+                f"[minimize] {int((~live).sum())} constraint(s) depend only on "
+                f"frozen parameters and are satisfied identically; dropped"
+            )
+        self._constraint_row_mask = live
+        lb = lb[live]
+
+        # keep_feasible=True requires a FEASIBLE starting point. scipy does not
+        # check: given an infeasible x0 it returns x0 unchanged, reporting
+        # success, which is indistinguishable from "converged immediately".
+        # So decide the flag from the actual starting point.
+        c0 = self._constraint_val_jac(xprobe)[0]
+        viol = lb - c0
+        worst = float(np.max(viol)) if len(viol) else 0.0
+        feasible = worst <= 1e-12
+        if not feasible:
+            bad = int(np.sum(viol > 1e-12))
+            logger.warning(
+                f"[minimize] starting point violates {bad}/{len(lb)} constraint(s) "
+                f"(worst by {worst:.3g}); running with keep_feasible=False so the "
+                f"minimizer can walk INTO the feasible region. Iterates may pass "
+                f"through unphysical parameter values on the way."
+            )
+        logger.info(
+            f"[minimize] {len(lb)} hard constraint(s) from "
+            f"{len(self.regularizers)} regularizer(s); penalty term DISABLED; "
+            f"start feasible={feasible} (margin to nearest bound {-worst:.3g})"
+        )
+        self.regularizers_as_constraints = True
+        return [
+            scipy.optimize.NonlinearConstraint(
+                fun=lambda xv: self._constraint_val_jac(xv)[0],
+                lb=lb,
+                ub=np.full_like(lb, np.inf),
+                jac=lambda xv: self._constraint_val_jac(xv)[1],
+                keep_feasible=feasible,
+            )
+        ]
+
+    def arm_regularizers(self):
+        """Tell every regularizer about the current parameter layout.
+
+        Must be called after anything that changes ``self.parms``, notably
+        ``init_fit_parms``.
+        """
         xinit = self.get_x()
         nexp0 = self.expected_yield(full=True)
         for reg in self.regularizers:
-            reg.set_expectations(xinit, nexp0)
+            reg.set_expectations(xinit, nexp0, parms=self.parms)
+        self._regularizers_armed = True
 
     def bayesassign(self):
         # Sample the parameter values from their priors: width sqrt(1/cw)
@@ -2088,7 +2261,12 @@ class Fitter:
 
         lbeta = self._compute_lbeta(beta, full_nll)
 
-        if len(self.regularizers):
+        if len(self.regularizers) and not self.regularizers_as_constraints:
+            if not getattr(self, "_regularizers_armed", False):
+                raise RuntimeError(
+                    "Regularizers not armed against the current parameter layout; "
+                    "call arm_regularizers() (or defaultassign()) first."
+                )
             x = self.get_x()
             penalties = [
                 reg.compute_nll_penalty(x, nexpfullcentral) * tf.exp(2 * self.tau)
@@ -2272,6 +2450,16 @@ class Fitter:
         callback = FitterCallback(xval, self.earlyStopping)
 
         if self.minimizer_method in [
+            "trust-constr",
+        ]:
+            # Constrained trust region: same hessp structure as trust-krylov (so
+            # the parameter count stays tractable), plus the regularizers'
+            # feasible sets as explicit NonlinearConstraints.
+            info_minimize = dict(hessp=scipy_hessp)
+            cons = self._build_scipy_constraints()
+            if cons:
+                info_minimize["constraints"] = cons
+        elif self.minimizer_method in [
             "trust-krylov",
             "trust-ncg",
         ]:
@@ -2314,14 +2502,57 @@ class Fitter:
             # minimizer could have called the loss or hessp functions with "random" values, so restore the
             # state from the end of the last iteration before the exception
             xval = callback.xval
+            self.minimizer_result = None
             logger.debug(ex)
         else:
             xval = res["x"]
+            self.minimizer_result = res
             logger.debug(res)
 
         self.x.assign(xval)
 
         return callback
+
+    def minimizer_status(self):
+        """Convergence outcome of the last :meth:`fit`, or None if none ran.
+
+        NB ``success`` is scipy's flag, not a convergence test on its own:
+        BFGS reports False ("precision loss") at points with EDM ~1e-17.
+        """
+        res = self.minimizer_result
+        if res is None:
+            return None
+        out = {
+            "success": bool(getattr(res, "success", False)),
+            "status": int(getattr(res, "status", -1)),
+            "nit": int(getattr(res, "nit", -1)),
+            "nfev": int(getattr(res, "nfev", -1)),
+            "message": str(getattr(res, "message", "")),
+        }
+        # Constrained runs (trust-constr) carry the only meaningful convergence
+        # measures for a problem with active constraints, and they were being
+        # discarded. At a constrained optimum the gradient is NOT zero -- it is
+        # balanced by the constraint forces -- so EDM says nothing, and
+        #     optimality      = ||grad f - sum_j mu_j grad g_j||_inf   (KKT residual)
+        #     constr_violation= max_j max(0, lb_j - g_j(x))           (feasibility)
+        # are what scipy itself tests against gtol:
+        #     if optimality < gtol and constr_violation < gtol: status = 1
+        # `v` holds the Lagrange multipliers, which separate a STRONGLY active
+        # constraint (mu >> 0, the data genuinely push into it) from a WEAKLY
+        # active one (mu ~ 0), a distinction the chi-bar-squared treatment needs.
+        for k in ("optimality", "constr_violation", "barrier_parameter", "tr_radius"):
+            v = getattr(res, k, None)
+            if v is not None:
+                out[k] = float(v)
+        mult = getattr(res, "v", None)
+        if mult is not None:
+            try:
+                out["multipliers"] = [
+                    float(x) for x in np.concatenate([np.atleast_1d(m) for m in mult])
+                ]
+            except Exception:
+                pass
+        return out
 
     def minimize(self):
         if self.is_linear:
