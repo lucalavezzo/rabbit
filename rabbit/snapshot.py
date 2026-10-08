@@ -79,6 +79,43 @@ def write_snapshot(filename, parms, x, meta=None):
     os.replace(tmp, filename)
 
 
+def read_vector(filename, fitresult_key=None):
+    """(names, values) from a snapshot (``x`` + ``parms``) or a rabbit fitresult (its ``parms`` histogram)."""
+    with h5py.File(filename, "r") as f:
+        if "x" in f.keys() and "parms" in f.keys():
+            return f["parms"][...].astype(str), np.asarray(
+                f["x"][...], dtype=np.float64
+            )
+    from rabbit import io_tools
+
+    h = io_tools.get_fitresult(filename, fitresult_key)["parms"].get()
+    return np.array([str(n) for n in h.axes[0]]), np.asarray(h.values(), np.float64)
+
+
+def seed_by_name(target_names, x, seed_names, seed_values, select=None):
+    """Copy ``seed_values`` onto ``x`` for every name present in both vectors.
+
+    ``select`` (optional): a predicate on the name; only matching entries are
+    seeded. Nothing is reordered or resized: parameters the seed lacks keep
+    their value in ``x``, and seed entries the target lacks are ignored, so a
+    seed from a fit with a slightly different parameter list (one more frozen
+    parameter, a different card nuisance) is usable. Returns the new vector and
+    the list of names that were seeded.
+    """
+    x = np.array(x, dtype=np.float64, copy=True)
+    target_names = [str(n) for n in np.asarray(target_names).astype(str)]
+    lookup = {
+        str(n): float(v)
+        for n, v in zip(np.asarray(seed_names).astype(str), seed_values)
+    }
+    seeded = []
+    for i, n in enumerate(target_names):
+        if n in lookup and (select is None or select(n)):
+            x[i] = lookup[n]
+            seeded.append(n)
+    return x, seeded
+
+
 def sibling_snapshot_path(filename, tag):
     """``filename`` with ``tag`` appended to its stem, or None if None.
 

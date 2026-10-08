@@ -188,6 +188,22 @@ def make_parser():
         help="load posfit nuisance parameters and covariance from result of an external fit.",
     )
     parser.add_argument(
+        "--saturatedSeed",
+        default=None,
+        type=str,
+        help="Seed the saturated sub-fit of --computeSaturatedProjectionTests from this snapshot or fitresult "
+        "(e.g. the snapshot_*_saturated_<mapping>.hdf5 of an earlier run), by parameter NAME, after the usual warm "
+        "start from the main fit. Which entries are seeded is set by --saturatedSeedScope. The seeded start is "
+        "kept only if its loss is finite and not above the warm start's; otherwise the warm start is used.",
+    )
+    parser.add_argument(
+        "--saturatedSeedScope",
+        default="projection",
+        choices=["projection", "all"],
+        help="'projection': seed only the saturated bin scales (the model parameters stay at the main fit's "
+        "minimum, so the start is the main fit plus better bin scales); 'all': every parameter the seed carries.",
+    )
+    parser.add_argument(
         "--externalPostfitResult",
         default=None,
         type=str,
@@ -359,6 +375,40 @@ def save_observed_hists(args, mappings, fitter, ws):
             fitter.varnobs.value() if fitter.varnobs is not None else None,
             fitter.indata.data_cov_inv,
             fitter.data_cov_inv.numpy() if fitter.data_cov_inv is not None else None,
+        )
+
+
+def seed_saturated_fit(fitter_saturated, path, scope, saturated_params):
+    """Seed the saturated sub-fit by name from ``path`` (see --saturatedSeed).
+
+    Runs after the warm start, whose loss equals the main fit's by
+    construction. The seeded point replaces it only if its loss is finite and
+    not higher; a seed can then only shorten the sub-fit, never make the
+    statistic start from a worse place than the unseeded run.
+    """
+    log = logger if logger is not None else logging.child_logger(__name__)
+    sat_names = set(np.asarray(saturated_params).astype(str))
+    select = None if scope == "all" else (lambda n: n in sat_names)
+    names = np.asarray(fitter_saturated.parms).astype(str)
+    x_warm = fitter_saturated.x.numpy().copy()
+    loss_warm = float(fitter_saturated._compute_loss())
+    seed_names, seed_values = snapshot.read_vector(path)
+    x_new, seeded = snapshot.seed_by_name(
+        names, x_warm, seed_names, seed_values, select
+    )
+    fitter_saturated.x.assign(x_new)
+    loss_seed = float(fitter_saturated._compute_loss())
+    n_sat = sum(1 for n in seeded if n in sat_names)
+    if np.isfinite(loss_seed) and loss_seed <= loss_warm:
+        log.info(
+            f"Saturated sub-fit seeded from {path} (scope {scope}): {len(seeded)} parameters "
+            f"({n_sat} of {len(sat_names)} bin scales); start loss {loss_seed} vs warm start {loss_warm}"
+        )
+    else:
+        fitter_saturated.x.assign(x_warm)
+        log.warning(
+            f"Saturated seed from {path} REJECTED: its start loss {loss_seed} is not below the warm "
+            f"start's {loss_warm}; using the warm start"
         )
 
 
@@ -581,6 +631,13 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # entries. xdefaultassign() above is deliberate but does not
                 # arm them.
                 fitter_saturated.arm_regularizers()
+                if args.saturatedSeed:
+                    seed_saturated_fit(
+                        fitter_saturated,
+                        args.saturatedSeed,
+                        args.saturatedSeedScope,
+                        saturated_model.params,
+                    )
                 cb = fitter_saturated.minimize()
                 cov_saturated = None
                 edmval = None
